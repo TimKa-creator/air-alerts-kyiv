@@ -22,7 +22,7 @@ TELEGRAM_SESSION = os.getenv('TG_SESSION') # Той довгий рядок
 
 # Канал, звідки крадемо інфу (наприклад, @kiev_air_raid або офіційний @kpszsu)
 # Встав сюди юзернейм каналу-донора (без @)
-SOURCE_CHANNEL = 'air_alert_ua' 
+SOURCE_CHANNEL = 'kpszsu' 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
