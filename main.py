@@ -13,15 +13,15 @@ from datetime import datetime, timezone
 API_TOKEN = os.getenv('ALERTS_API_TOKEN')
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-CHANNEL_ID = '@KyivAegis' # Нова назва!
+CHANNEL_ID = '@KyivAegis' 
 TARGET_REGION_ID = 31 # Київ
 CHECK_INTERVAL = 15
 
-# Telethon (Userbot)
+# Telethon
 TELEGRAM_API_ID = int(os.getenv('TG_API_ID'))
 TELEGRAM_API_HASH = os.getenv('TG_API_HASH')
 TELEGRAM_SESSION = os.getenv('TG_SESSION')
-SOURCE_CHANNEL = 'kpszsu' # Офіційний канал ПС ЗСУ (або зміни на інший)
+SOURCE_CHANNEL = 'kpszsu' 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,36 +34,32 @@ class AIRephraser:
             self.model = genai.GenerativeModel('gemini-1.5-flash')
             self.is_active = True
         else:
-            logger.warning("Gemini API Key not found! AI rephrasing disabled.")
             self.is_active = False
 
-    async def rephrase(self, text):
+    async def rephrase(self, text, is_update=False):
         if not self.is_active or not text:
             return text
         
+        # Різні промпти для початку тривоги і для оновлень
+        context = "початок тривоги" if not is_update else "оновлення ситуації під час тривоги"
+        
+        prompt = (
+            f"Ти - черговий системи 'Kyiv Aegis'. Контекст: {context}. "
+            f"Перепиши вхідне повідомлення лаконічно, для цивільних. "
+            f"Вимоги: Українська мова. Використовуй HTML (<b>, <i>). "
+            f"Суть: звідки/куди летить, тип загрози. Без води. "
+            f"Вхідний текст: {text}"
+        )
         try:
-            # Промпт з інструкцією про HTML
-            prompt = (
-                f"Ти - оперативний черговий системи 'Kyiv Aegis'. "
-                f"Твоє завдання: переписати вхідне повідомлення про повітряну загрозу. "
-                f"Вимоги:\n"
-                f"1. Пиши лаконічно, спокійно, по-військовому чітко. Українською мовою.\n"
-                f"2. Використовуй HTML теги для форматування: <b>жирний</b> для важливого, "
-                f"<i>курсив</i> для деталей. НЕ використовуй Markdown (** або __).\n"
-                f"3. Прибери зайві емодзі, залиш тільки суть (тип ракети, напрямок, час підльоту).\n"
-                f"4. Не згадуй джерела і не пиши вступних слів типу 'Ось переписане повідомлення'.\n"
-                f"Вхідний текст: {text}"
-            )
-            
             response = await asyncio.to_thread(self.model.generate_content, prompt)
             return response.text.strip()
         except Exception as e:
             logger.error(f"AI Error: {e}")
             return text
 
-# --- WEB SERVER (Для Render) ---
+# --- WEB SERVER ---
 async def health_check(request):
-    return web.Response(text="Kyiv Aegis System: ONLINE")
+    return web.Response(text="Kyiv Aegis: LIVE MONITORING ACTIVE")
 
 async def start_web_server():
     app = web.Application()
@@ -78,10 +74,13 @@ async def start_web_server():
 class AlertMonitor:
     def __init__(self):
         self.bot = Bot(token=BOT_TOKEN)
-        self.last_alert_status = False
         self.headers = {'Authorization': f'Bearer {API_TOKEN}'}
         self.client = TelegramClient(StringSession(TELEGRAM_SESSION), TELEGRAM_API_ID, TELEGRAM_API_HASH)
         self.ai = AIRephraser(GEMINI_API_KEY)
+        
+        # СТАН
+        self.last_alert_status = False
+        self.last_processed_msg_id = None # Запам'ятовуємо останнє повідомлення
 
     async def get_alert_status(self):
         url = "https://api.alerts.in.ua/v1/alerts/active.json"
@@ -90,21 +89,21 @@ class AlertMonitor:
                 async with session.get(url, headers=self.headers) as resp:
                     if resp.status == 200:
                         return await resp.json()
-        except Exception as e:
-            logger.error(f"API Error: {e}")
+        except Exception:
+            pass
         return None
 
-    async def get_reason_from_channel(self):
+    async def get_latest_message_from_channel(self):
+        """Повертає об'єкт повідомлення або None"""
         try:
-            # Беремо останнє повідомлення
             messages = await self.client.get_messages(SOURCE_CHANNEL, limit=1)
             if not messages: return None
             
             msg = messages[0]
-            # Перевірка свіжості (15 хв)
-            if (datetime.now(timezone.utc) - msg.date).total_seconds() > 900:
+            # Перевірка свіжості (10 хв)
+            if (datetime.now(timezone.utc) - msg.date).total_seconds() > 600:
                 return None
-            return msg.text
+            return msg
         except Exception as e:
             logger.error(f"Telethon Error: {e}")
             return None
@@ -117,14 +116,13 @@ class AlertMonitor:
 
     async def send_message(self, text):
         try:
-            # Важливо: parse_mode="HTML"
             await self.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Send Error: {e}")
 
     async def monitor_loop(self):
         await self.client.connect()
-        logger.info("Kyiv Aegis monitoring started.")
+        logger.info("Monitor started.")
 
         while True:
             data = await self.get_alert_status()
@@ -132,33 +130,38 @@ class AlertMonitor:
                 region_alert = self.find_region_data(data, TARGET_REGION_ID)
                 is_alert_active = region_alert is not None
 
+                # 1. ПОЧАТОК ТРИВОГИ
                 if is_alert_active and not self.last_alert_status:
-                    # --- ТРИВОГА ---
                     self.last_alert_status = True
-                    await self.send_message("🔴 <b>ПОВІТРЯНА ТРИВОГА В КИЄВІ!</b>\n\nПройдіть в укриття!")
+                    await self.send_message("🔴 <b>ПОВІТРЯНА ТРИВОГА В КИЄВІ!</b>\n\nНегайно в укриття!")
                     
-                    # 1. Отримуємо текст з каналу
-                    channel_text = await self.get_reason_from_channel()
+                    # Отримуємо першу причину
+                    msg = await self.get_latest_message_from_channel()
+                    if msg:
+                        self.last_processed_msg_id = msg.id
+                        ai_text = await self.ai.rephrase(msg.text, is_update=False)
+                        await asyncio.sleep(2)
+                        await self.send_message(f"⚠️ <b>Загроза:</b>\n{ai_text}")
+
+                # 2. ТРИВОГА ТРИВАЄ (МОНІТОРИНГ ОНОВЛЕНЬ)
+                elif is_alert_active and self.last_alert_status:
+                    # Перевіряємо, чи є нові повідомлення
+                    msg = await self.get_latest_message_from_channel()
                     
-                    reason_msg = ""
-                    if channel_text:
-                        # 2. Обробка через AI
-                        ai_text = await self.ai.rephrase(channel_text)
-                        reason_msg = f"⚠️ <b>Загроза:</b>\n{ai_text}"
-                    else:
-                        # Запасний варіант (API)
-                        notes = region_alert.get('notes', '')
-                        if notes:
-                             reason_msg = f"⚠️ <b>Загроза:</b> {notes}"
-                        else:
-                             reason_msg = "⚠️ <b>Загроза:</b> Інформація уточнюється."
+                    # Якщо повідомлення є, воно нове (ID змінився) і текст не порожній
+                    if msg and msg.id != self.last_processed_msg_id:
+                        self.last_processed_msg_id = msg.id # Запам'ятовуємо нове ID
+                        
+                        logger.info("New update detected!")
+                        ai_text = await self.ai.rephrase(msg.text, is_update=True)
+                        
+                        # Відправляємо оновлення
+                        await self.send_message(f"📡 <b>Оновлення ситуації:</b>\n{ai_text}")
 
-                    await asyncio.sleep(2)
-                    await self.send_message(reason_msg)
-
+                # 3. ВІДБІЙ
                 elif not is_alert_active and self.last_alert_status:
-                    # --- ВІДБІЙ ---
                     self.last_alert_status = False
+                    self.last_processed_msg_id = None # Скидаємо пам'ять
                     await self.send_message("🟢 <b>ВІДБІЙ ПОВІТРЯНОЇ ТРИВОГИ!</b>")
 
             await asyncio.sleep(CHECK_INTERVAL)
